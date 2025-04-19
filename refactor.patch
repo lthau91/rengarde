@@ -1,0 +1,1846 @@
+From 277c53df8b437919b1ceffcb6d29ccc4a88eac97 Mon Sep 17 00:00:00 2001
+From: Hau Lam <lthau91@gmail.com>
+Date: Sat, 19 Apr 2025 11:46:05 +0800
+Subject: [PATCH] refactor client, server, shared
+
+---
+ crates/client/src/lib.rs                  |   9 +
+ crates/client/src/main.rs                 | 469 +---------------------
+ crates/client/src/service.rs              | 316 +++++++++++++++
+ crates/client/src/types.rs                |  94 +++++
+ crates/server/src/client/connection.rs    |  42 ++
+ crates/server/src/client/manager.rs       |  66 +++
+ crates/server/src/client/mod.rs           |   7 +
+ crates/server/src/client/types.rs         |  36 ++
+ crates/server/src/config.rs               |  71 ++++
+ crates/server/src/main.rs                 | 271 ++++---------
+ crates/server/src/wireguard/connection.rs |  65 +++
+ crates/server/src/wireguard/mod.rs        |   4 +
+ crates/server/src/wireguard/types.rs      |  21 +
+ crates/shared/src/lib.rs                  |  80 ++--
+ 14 files changed, 872 insertions(+), 679 deletions(-)
+ create mode 100644 crates/client/src/lib.rs
+ create mode 100644 crates/client/src/service.rs
+ create mode 100644 crates/client/src/types.rs
+ create mode 100644 crates/server/src/client/connection.rs
+ create mode 100644 crates/server/src/client/manager.rs
+ create mode 100644 crates/server/src/client/mod.rs
+ create mode 100644 crates/server/src/client/types.rs
+ create mode 100644 crates/server/src/config.rs
+ create mode 100644 crates/server/src/wireguard/connection.rs
+ create mode 100644 crates/server/src/wireguard/mod.rs
+ create mode 100644 crates/server/src/wireguard/types.rs
+
+diff --git a/crates/client/src/lib.rs b/crates/client/src/lib.rs
+new file mode 100644
+index 0000000..a2e0615
+--- /dev/null
++++ b/crates/client/src/lib.rs
+@@ -0,0 +1,9 @@
++// The maximum transmission unit (MTU) of an Ethernet frame is 1518 bytes with the normal untagged
++// Ethernet frame overhead of 18 bytes and the 1500-byte payload.
++pub const BUFFER_SIZE: usize = 1500;
++
++pub mod types;
++pub mod service;
++
++pub use types::{Settings, ClientSettings, WebManager};
++pub use service::Service; 
+\ No newline at end of file
+diff --git a/crates/client/src/main.rs b/crates/client/src/main.rs
+index 8430f0e..c3a3160 100644
+--- a/crates/client/src/main.rs
++++ b/crates/client/src/main.rs
+@@ -1,133 +1,12 @@
+-#![feature(ip)]
+-#![feature(test)]
+-
+-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+-use std::sync::{Arc, Mutex};
+-use std::time::Instant;
+-
+-use anyhow::{anyhow, Result};
+-use dashmap::DashMap;
+-use futures::StreamExt;
++use anyhow::Result;
+ use network_interface::{NetworkInterface, NetworkInterfaceConfig};
+-use serde::{Deserialize, Serialize};
+-use tokio::net::UdpSocket;
+-use tokio::select;
+-use tokio::time::sleep;
+-use tokio_util::sync::CancellationToken;
+-use tracing::{debug, info, info_span, Instrument, trace, warn};
+-
+-// The maximum transmission unit (MTU) of an Ethernet frame is 1518 bytes with the normal untagged
+-// Ethernet frame overhead of 18 bytes and the 1500-byte payload.
+-const BUFFER_SIZE: usize = 1500;
+-
+-#[derive(Debug, Clone, Serialize, Deserialize)]
+-pub struct Settings {
+-    client: ClientSettings,
+-}
+-
+-#[derive(Debug, Clone, Serialize, Deserialize)]
+-#[serde(rename_all = "camelCase")]
+-pub struct ClientSettings {
+-    description: Option<String>,
+-    listen_addr: String,
+-    dst_addr: String,
+-    // Write timeout in milliseconds for socket writes. You can try to lower it if you're experiencing latency peaks, or raising it if the connection is unstable.
+-    // You can disable write timeout by setting to 0; but it's easy to have issues if you need low latency.
+-    write_timeout: Option<u64>,
+-    excluded_interfaces: Vec<String>,
+-    // dst_overrides: HashMap<String, String>,
+-    web_manager: Option<WebManager>,
+-}
+-
+-#[derive(Debug, Clone, Serialize, Deserialize)]
+-#[serde(rename_all = "camelCase")]
+-pub struct WebManager {
+-    listen_addr: Option<String>,
+-    username: Option<String>,
+-    password: Option<String>,
+-}
+-
+-type SendingRoutines = Arc<DashMap<String, SendingRoutine>>;
+-
+-struct SendingRoutine {
+-    ifname: String,
+-    src_socket: Arc<UdpSocket>,
+-    src_addr: SocketAddr,
+-    dst_addr: SocketAddr,
+-    last_received_at: Instant,
+-    total_received_bytes: usize,
+-    is_closing: bool,
+-}
+-
+-impl SendingRoutine {
+-    fn new(ifname: String, src_socket: Arc<UdpSocket>, src_addr: SocketAddr, dst_addr: SocketAddr) -> Self {
+-        info!(
+-            event = "added",
+-            iface_name = ifname,
+-            src_addr = src_addr.to_string(),
+-            dst_addr = dst_addr.to_string(),
+-            "\tAdded interface '{}' to sending routines", ifname
+-        );
+-        Self {
+-            ifname,
+-            src_socket,
+-            src_addr,
+-            dst_addr,
+-            last_received_at: Instant::now(),
+-            total_received_bytes: 0,
+-            is_closing: false,
+-        }
+-    }
++use tracing::{info, warn};
+ 
+-    // returns key if the routine needs to be closed
+-    #[tracing::instrument(skip_all)]
+-    async fn send_to(&mut self, buf: &[u8]) -> Option<String> {
+-        // TODO: implement a write timeout
+-        // debug!("\tSending {} bytes on iface {} to client '{:?}'", buf.len(), self.ifname, self.dst_addr);
+-        match self.src_socket.send_to(buf, self.dst_addr).await {
+-            Ok(sent_bytes) => {
+-                trace!(
+-                    sent_bytes = sent_bytes,
+-                    dst_ifname = self.ifname,
+-                    dst_addr = self.dst_addr.to_string(),
+-                    "\tSent {} bytes on iface {} to client '{:?}'", sent_bytes, self.ifname, self.dst_addr
+-                );
+-                // self.last_sent_at = Instant::now();
+-                // self.total_sent_bytes += sent_bytes;
+-                None
+-            }
+-            Err(err) => {
+-                warn!(
+-                    event = "disconnect",
+-                    dst_addr = self.dst_addr.to_string(),
+-                    "Error writing to client '{:?}', terminating it: {:?}", self.dst_addr, err
+-                );
+-                Some(self.ifname.clone())
+-            }
+-        }
+-    }
+-}
++mod types;
++mod service;
+ 
+-impl Drop for SendingRoutine {
+-    fn drop(&mut self) {
+-        debug!(
+-            event = "removed",
+-            iface_name = self.ifname,
+-            src_addr = self.src_addr.to_string(),
+-            dst_addr = self.dst_addr.to_string(),
+-            "\tRemoved interface '{}' from sending routines", self.ifname
+-        );
+-    }
+-}
+-
+-#[derive(Clone)]
+-struct Service {
+-    shutdown: CancellationToken,
+-    settings: ClientSettings,
+-    routines: SendingRoutines,
+-    // wireguard_socket: Arc<UdpSocket>,
+-    source_addr: Arc<Mutex<SocketAddr>>,
+-}
++use service::Service;
++use types::Settings;
+ 
+ #[tokio::main]
+ async fn main() -> Result<()> {
+@@ -173,20 +52,15 @@ async fn main() -> Result<()> {
+         info!("{}", description);
+     }
+ 
+-    // default to 10; but allow 0 for disabling write timeout
+     if settings.client.write_timeout.is_none() {
+         info!("Write timeout not set; setting to 10ms.");
+         settings.client.write_timeout = Some(10);
+     }
+-    // warn if write timeout is enabled; it's not implemented yet
+     if !matches!(settings.client.write_timeout, Some(0)) {
+         warn!("Write timeout is not implemented yet: setting to 0 to disable!");
+         settings.client.write_timeout = Some(0);
+     }
+ 
+-    let settings = settings;
+-    // dbg!(&settings);
+-
+     let service = Service::new(settings.client);
+     service.run().await?;
+     Ok(())
+@@ -205,331 +79,30 @@ fn list_interfaces() -> Result<()> {
+     Ok(())
+ }
+ 
+-fn get_address_by_interface(iface: &NetworkInterface) -> Option<IpAddr> {
++fn get_address_by_interface(iface: &NetworkInterface) -> Option<std::net::IpAddr> {
+     iface.addr.iter().find_map(|addr| {
+         let ip = addr.ip();
+         match ip {
+-            IpAddr::V4(v4) => {
+-                // include shared ips; used by starlink
+-                if v4.is_shared() {
++            std::net::IpAddr::V4(v4) => {
++                // Include private network IPs (192.168.x.x, 10.x.x.x, etc.)
++                if v4.is_private() {
++                    return Some(ip);
++                }
++                // Include loopback addresses (127.x.x.x)
++                if v4.is_loopback() {
++                    return Some(ip);
++                }
++                // Include link-local addresses (169.254.x.x)
++                if v4.is_link_local() {
+                     return Some(ip);
+                 }
+-                // exclude everything else that's global
+-                if !v4.is_global() {
++                // Exclude multicast addresses
++                if v4.is_multicast() {
+                     return None;
+                 }
+                 Some(ip)
+             }
+-            IpAddr::V6(_) => {
+-                // TODO: handle IPv6
+-                None
+-            }
++            std::net::IpAddr::V6(_) => None,
+         }
+     })
+ }
+-
+-impl Service {
+-    fn new(settings: ClientSettings) -> Self {
+-        Self {
+-            shutdown: CancellationToken::new(),
+-            settings,
+-            routines: Arc::new(Default::default()),
+-            source_addr: Arc::new(Mutex::new(
+-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0)
+-            )),
+-        }
+-    }
+-
+-    //#[tracing::instrument(skip_all)]
+-    async fn run(&self) -> Result<()> {
+-        let settings = &self.settings;
+-
+-        // let clients: Clients = Arc::new(DashMap::new());
+-
+-        // let wireguard_addr = settings.client.dst_addr.parse()?;
+-        let wireguard_socket = Arc::new(UdpSocket::bind(&settings.listen_addr).await?);
+-
+-        info!("Listening on: {}", &settings.listen_addr);
+-
+-        if let Some(web_manager) = &settings.web_manager {
+-            warn!("Web manager is not implemented yet: {:?}", web_manager);
+-        }
+-
+-        let join_update_available_interfaces = tokio::spawn({
+-            let service = self.clone();
+-            let wireguard_socket = wireguard_socket.clone();
+-            async move {
+-                if let Err(err) = service.update_available_interfaces(wireguard_socket).await {
+-                    warn!("update_available_interfaces thread failed: {:?}", err);
+-                }
+-            }
+-        });
+-
+-        let join_receive_from_wireguard = tokio::spawn({
+-            let service = self.clone();
+-            async move {
+-                if let Err(err) = service.receive_from_wireguard(wireguard_socket).await {
+-                    warn!("receive_from_wireguard thread failed: {:?}", err);
+-                }
+-            }
+-        });
+-
+-        select! {
+-            _ = tokio::signal::ctrl_c() => {
+-                info!("ctrl + c received; shutting down...");
+-            }
+-            _ = join_update_available_interfaces => {
+-                warn!("update_available_interfaces thread closed");
+-            }
+-            _ = join_receive_from_wireguard => {
+-                warn!("receive_from_wireguard thread closed");
+-            }
+-        }
+-
+-        debug!("shutdown starting; sending cancel");
+-        self.shutdown.cancel();
+-        debug!("shutdown finished; cancel returned");
+-        Ok(())
+-    }
+-
+-    //#[tracing::instrument(skip_all)]
+-    async fn update_available_interfaces(&self, wireguard_socket: Arc<UdpSocket>) -> Result<()> {
+-        loop {
+-            // if self.shutdown.cancelled() {
+-            //     debug!("Shutdown signal received; closing thread");
+-            //     return Ok(());
+-            // }
+-
+-            debug!("Checking available interfaces...");
+-            let interfaces = NetworkInterface::show()?;
+-            // TODO: retry?
+-
+-            // delete unavailable interfaces
+-            let drop_list: Vec<_> = self.routines.iter().filter_map(|routine| {
+-                if self.settings.excluded_interfaces.contains(routine.key()) {
+-                    warn!("Interface '{}' is excluded; removing it", routine.key());
+-                    return Some(routine.key().clone());
+-                }
+-                match interfaces.iter().find(|interface| &interface.name == routine.key()) {
+-                    Some(iface) => {
+-                        match get_address_by_interface(iface) {
+-                            Some(addr) => {
+-                                if addr != routine.value().src_addr.ip() {
+-                                    info!("Interface '{}' address changed; re-creating it", routine.key());
+-                                    Some(routine.key().clone())
+-                                } else {
+-                                    // all good
+-                                    None
+-                                }
+-                            }
+-                            None => {
+-                                warn!("Interface '{}' has no address; removing it", routine.key());
+-                                Some(routine.key().clone())
+-                            }
+-                        }
+-                    }
+-                    None => {
+-                        warn!("Interface '{}' no longer exists; removing it", routine.key());
+-                        Some(routine.key().clone())
+-                    }
+-                }
+-            }).collect();
+-
+-            // drop the interfaces that are no longer available
+-            if !drop_list.is_empty() {
+-                drop_list.into_iter().for_each(|key| {
+-                    self.routines.remove(&key);
+-                });
+-            }
+-
+-            // create new interfaces
+-            for iface in interfaces {
+-                // skip excluded interfaces
+-                if self.settings.excluded_interfaces.contains(&iface.name) {
+-                    continue;
+-                }
+-                // skip if the interface already exists
+-                if self.routines.contains_key(&iface.name) {
+-                    continue;
+-                }
+-
+-                if let Some(source_addr) = get_address_by_interface(&iface) {
+-                    if let Err(err) = self.create_send_thread(&iface, source_addr, wireguard_socket.clone()).await {
+-                        warn!("Failed to create send thread for interface '{}': {:?}", iface.name, err);
+-                    }
+-                    debug!("Created send thread for interface '{}'", iface.name);
+-                }
+-            }
+-
+-            debug!("Checking available interfaces finished; sleeping...");
+-            select! {
+-                _ = self.shutdown.cancelled() => {
+-                    debug!("Shutdown signal received; closing update_available_interfaces thread");
+-                    return Ok(());
+-                }
+-                _ = sleep(std::time::Duration::from_secs(1)) => {}
+-            }
+-        }
+-    }
+-
+-    //#[tracing::instrument(skip_all)]
+-    async fn create_send_thread(&self, iface: &NetworkInterface, source_addr: IpAddr, wireguard_socket: Arc<UdpSocket>) -> Result<()> {
+-        info!("New interface '{}' with IP '{}', adding it", iface.name, source_addr);
+-
+-        // TODO: allow destination overrides
+-        let dst_addr = tokio::net::lookup_host(&self.settings.dst_addr)
+-            .await
+-            .map_err(|err| anyhow!("Failed to resolve destination address '{}': {:?}", self.settings.dst_addr, err))
+-            .and_then(|mut addrs| {
+-                addrs.next().ok_or_else(|| anyhow!("No address found for destination address '{}'", self.settings.dst_addr))
+-            })?;
+-        debug!("\tDestination address: '{:?}'", dst_addr);
+-
+-        let src_addr = SocketAddr::new(source_addr, 0);
+-        debug!("\tSource address: '{:?}'", src_addr);
+-
+-        let src_socket = UdpSocket::bind(src_addr).await?;
+-        debug!("\tBound udp socket to '{}'", src_addr);
+-
+-        // let src_socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+-        // src_socket.set_reuse_address(true)?;
+-        if !iface.name.is_empty() {
+-            src_socket.bind_device(Some(iface.name.as_bytes()))?;
+-            debug!("\tBound udp socket to interface '{}'", iface.name);
+-        }
+-
+-        // TODO: should we be using the above, or below src_addr, or maybe even lookup_host?
+-        // let src_addr = src_socket.local_addr()?;
+-
+-        let src_socket = Arc::new(src_socket);
+-
+-        let routine = SendingRoutine::new(
+-            iface.name.to_owned(),
+-            src_socket,
+-            src_addr,
+-            dst_addr,
+-        );
+-
+-        if let Some(routine) = self.routines.insert(iface.name.to_owned(), routine) {
+-            // TODO: handle this case...
+-            panic!("Interface '{}' already existed when we tried to add it", routine.ifname);
+-        };
+-
+-        tokio::spawn({
+-            let this = self.clone();
+-            let ifname = iface.name.to_owned();
+-            let wireguard_socket = wireguard_socket.clone();
+-            async move {
+-                if let Err(err) = this.wireguard_write_back(ifname.clone(), wireguard_socket).await {
+-                    warn!("wireguard_write_back thread failed: {:?}", err);
+-                };
+-                debug!("wireguard_write_back thread closed: '{}'", ifname);
+-            }
+-        });
+-        debug!("\tStarted wireguard_write_back thread for interface '{}'", iface.name);
+-
+-        Ok(())
+-    }
+-
+-    //#[tracing::instrument(skip_all)]
+-    async fn wireguard_write_back(&self, ifname: String, wireguard_socket: Arc<UdpSocket>) -> Result<()> {
+-        let mut buf = [0; BUFFER_SIZE];
+-        loop {
+-            // if self.shutdown.is_cancelled() {
+-            //     debug!("Shutdown signal received; closing thread");
+-            //     return Ok(());
+-            // }
+-
+-            let routine = self.routines.get(&ifname).ok_or_else(|| anyhow!("Interface '{}' not found", ifname))?;
+-            debug!("Got interface {} from routines", ifname);
+-            if routine.is_closing {
+-                warn!("Interface '{}' is closing; closing thread", ifname);
+-                return Ok(());
+-            }
+-            // clone the socket
+-            let socket = routine.src_socket.clone();
+-            // drop the lock so we can receive from the interface
+-            drop(routine);
+-
+-            debug!("Waiting for data from interface '{}'", ifname);
+-            select! {
+-                t = socket.recv_from(&mut buf) => {
+-                    match t {
+-                        Ok((received_bytes, _)) => {
+-                            debug!("Received {} bytes from interface '{}'", received_bytes, ifname);
+-                            let mut routine = self.routines.get_mut(&ifname).ok_or_else(|| anyhow!("Interface '{}' not found", ifname))?;
+-                            routine.last_received_at = Instant::now();
+-                            routine.total_received_bytes += received_bytes;
+-                            // drop the lock so we can send to wireguard
+-                            drop(routine);
+-
+-                            // send to wireguard
+-                            let wg_addr = *self.source_addr.lock().unwrap();
+-                            wireguard_socket.send_to(&buf[..received_bytes], wg_addr).await?;
+-                            trace!("\tSent {} bytes to wireguard", received_bytes);
+-                        }
+-                        Err(err) => {
+-                            warn!("Error receiving from interface '{}': {:?}", ifname, err);
+-                            let mut routine = self.routines.get_mut(&ifname).ok_or_else(|| anyhow!("Interface '{}' not found", ifname))?;
+-                            routine.is_closing = true;
+-                        }
+-                    }
+-                }
+-                _ = self.shutdown.cancelled() => {
+-                    debug!("Shutdown signal received; closing thread");
+-                    return Ok(());
+-                }
+-            }
+-        }
+-    }
+-
+-    //#[tracing::instrument(skip_all)]
+-    async fn receive_from_wireguard(&self, wireguard_socket: Arc<UdpSocket>) -> Result<()> {
+-        let mut buf = [0; BUFFER_SIZE];
+-        loop {
+-            let span = info_span!("receive_from_wireguard_loop");
+-            select! {
+-                _ = self.shutdown.cancelled() => {
+-                    debug!("Shutdown signal received; closing thread");
+-                    return Ok(());
+-                }
+-                result = wireguard_socket.recv_from(&mut buf).instrument(span) => {
+-                    match result {
+-                        Ok((received_bytes, src_addr)) => {
+-                            *self.source_addr.lock().unwrap() = src_addr;
+-                            trace!(
+-                                received_bytes = received_bytes,
+-                                src_addr = src_addr.to_string(),
+-                                "Received {} bytes from wireguard on '{:?}'", received_bytes, src_addr
+-                            );
+-                            trace!("\tSending to {} clients", self.routines.len());
+-
+-                            // send to interfaces in parallel using streams
+-                            let drop_list = futures::stream::iter(self.routines.iter_mut())
+-                                .filter_map(|mut routine| async move {
+-                                    routine.send_to(&buf[..received_bytes]).await
+-                                })
+-                                .collect::<Vec<String>>()
+-                                .await;
+-
+-                            // drop the clients that have timed out
+-                            if !drop_list.is_empty() {
+-                                // TODO: can we do this with DashMap without locking each iteration?
+-                                // let mut routines = self.routines.write().unwrap();
+-                                drop_list.into_iter().for_each(|ifname| {
+-                                    self.routines.remove(&ifname);
+-                                });
+-                                // drop(routines);
+-                            }
+-
+-                            trace!("Sent to {} clients", self.routines.len());
+-                        }
+-                        Err(err) => {
+-                            warn!("Error receiving from wireguard: {:?}", err);
+-                        }
+-                    }
+-                }
+-            }
+-        }
+-    }
+-}
+diff --git a/crates/client/src/service.rs b/crates/client/src/service.rs
+new file mode 100644
+index 0000000..68211d4
+--- /dev/null
++++ b/crates/client/src/service.rs
+@@ -0,0 +1,316 @@
++use std::net::SocketAddr;
++use std::sync::{Arc, Mutex};
++
++use anyhow::{anyhow, Result};
++use dashmap::DashMap;
++use futures::StreamExt;
++use network_interface::{NetworkInterface, NetworkInterfaceConfig};
++use tokio::net::UdpSocket;
++use tokio::select;
++use tokio::time::sleep;
++use tokio_util::sync::CancellationToken;
++use tracing::{debug, info, info_span, Instrument, trace, warn};
++
++use crate::types::{ClientSettings, SendingRoutine};
++
++// The maximum transmission unit (MTU) of an Ethernet frame is 1518 bytes with the normal untagged
++// Ethernet frame overhead of 18 bytes and the 1500-byte payload.
++const BUFFER_SIZE: usize = 1500;
++
++type SendingRoutines = Arc<DashMap<String, SendingRoutine>>;
++
++#[derive(Clone)]
++pub struct Service {
++    shutdown: CancellationToken,
++    settings: ClientSettings,
++    routines: SendingRoutines,
++    source_addr: Arc<Mutex<SocketAddr>>,
++}
++
++impl Service {
++    pub fn new(settings: ClientSettings) -> Self {
++        Self {
++            shutdown: CancellationToken::new(),
++            settings,
++            routines: Arc::new(DashMap::new()),
++            source_addr: Arc::new(Mutex::new(
++                SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), 0)
++            )),
++        }
++    }
++
++    pub async fn run(&self) -> Result<()> {
++        let settings = &self.settings;
++        let wireguard_socket = Arc::new(UdpSocket::bind(&settings.listen_addr).await?);
++
++        info!("Listening on: {}", &settings.listen_addr);
++
++        if let Some(web_manager) = &settings.web_manager {
++            warn!("Web manager is not implemented yet: {:?}", web_manager);
++        }
++
++        let join_update_available_interfaces = tokio::spawn({
++            let service = self.clone();
++            let wireguard_socket = wireguard_socket.clone();
++            async move {
++                if let Err(err) = service.update_available_interfaces(wireguard_socket).await {
++                    warn!("update_available_interfaces thread failed: {:?}", err);
++                }
++            }
++        });
++
++        let join_receive_from_wireguard = tokio::spawn({
++            let service = self.clone();
++            async move {
++                if let Err(err) = service.receive_from_wireguard(wireguard_socket).await {
++                    warn!("receive_from_wireguard thread failed: {:?}", err);
++                }
++            }
++        });
++
++        select! {
++            _ = tokio::signal::ctrl_c() => {
++                info!("ctrl + c received; shutting down...");
++            }
++            _ = join_update_available_interfaces => {
++                warn!("update_available_interfaces thread closed");
++            }
++            _ = join_receive_from_wireguard => {
++                warn!("receive_from_wireguard thread closed");
++            }
++        }
++
++        debug!("shutdown starting; sending cancel");
++        self.shutdown.cancel();
++        debug!("shutdown finished; cancel returned");
++        Ok(())
++    }
++
++    async fn update_available_interfaces(&self, wireguard_socket: Arc<UdpSocket>) -> Result<()> {
++        loop {
++            debug!("Checking available interfaces...");
++            let interfaces = NetworkInterface::show()?;
++
++            let drop_list: Vec<_> = self.routines.iter().filter_map(|routine| {
++                if self.settings.excluded_interfaces.contains(routine.key()) {
++                    warn!("Interface '{}' is excluded; removing it", routine.key());
++                    return Some(routine.key().clone());
++                }
++                match interfaces.iter().find(|interface| &interface.name == routine.key()) {
++                    Some(iface) => {
++                        match get_address_by_interface(iface) {
++                            Some(addr) => {
++                                if addr != routine.value().src_addr.ip() {
++                                    info!("Interface '{}' address changed; re-creating it", routine.key());
++                                    Some(routine.key().clone())
++                                } else {
++                                    None
++                                }
++                            }
++                            None => {
++                                warn!("Interface '{}' has no address; removing it", routine.key());
++                                Some(routine.key().clone())
++                            }
++                        }
++                    }
++                    None => {
++                        warn!("Interface '{}' no longer exists; removing it", routine.key());
++                        Some(routine.key().clone())
++                    }
++                }
++            }).collect();
++
++            if !drop_list.is_empty() {
++                drop_list.into_iter().for_each(|key| {
++                    self.routines.remove(&key);
++                });
++            }
++
++            for iface in interfaces {
++                if self.settings.excluded_interfaces.contains(&iface.name) {
++                    continue;
++                }
++                if self.routines.contains_key(&iface.name) {
++                    continue;
++                }
++
++                if let Some(source_addr) = get_address_by_interface(&iface) {
++                    if let Err(err) = self.create_send_thread(&iface, source_addr, wireguard_socket.clone()).await {
++                        warn!("Failed to create send thread for interface '{}': {:?}", iface.name, err);
++                    }
++                    debug!("Created send thread for interface '{}'", iface.name);
++                }
++            }
++
++            debug!("Checking available interfaces finished; sleeping...");
++            select! {
++                _ = self.shutdown.cancelled() => {
++                    debug!("Shutdown signal received; closing update_available_interfaces thread");
++                    return Ok(());
++                }
++                _ = sleep(std::time::Duration::from_secs(1)) => {}
++            }
++        }
++    }
++
++    async fn create_send_thread(&self, iface: &NetworkInterface, source_addr: std::net::IpAddr, wireguard_socket: Arc<UdpSocket>) -> Result<()> {
++        info!("New interface '{}' with IP '{}', adding it", iface.name, source_addr);
++
++        let dst_addr = tokio::net::lookup_host(&self.settings.dst_addr)
++            .await
++            .map_err(|err| anyhow!("Failed to resolve destination address '{}': {:?}", self.settings.dst_addr, err))
++            .and_then(|mut addrs| {
++                addrs.next().ok_or_else(|| anyhow!("No address found for destination address '{}'", self.settings.dst_addr))
++            })?;
++        debug!("\tDestination address: '{:?}'", dst_addr);
++
++        let src_addr = SocketAddr::new(source_addr, 0);
++        debug!("\tSource address: '{:?}'", src_addr);
++
++        let src_socket = UdpSocket::bind(src_addr).await?;
++        debug!("\tBound udp socket to '{}'", src_addr);
++
++        if !iface.name.is_empty() {
++            src_socket.bind_device(Some(iface.name.as_bytes()))?;
++            debug!("\tBound udp socket to interface '{}'", iface.name);
++        }
++
++        let src_socket = Arc::new(src_socket);
++
++        let routine = SendingRoutine::new(
++            iface.name.to_owned(),
++            src_socket,
++            src_addr,
++            dst_addr,
++        );
++
++        if let Some(routine) = self.routines.insert(iface.name.to_owned(), routine) {
++            panic!("Interface '{}' already existed when we tried to add it", routine.ifname);
++        };
++
++        tokio::spawn({
++            let this = self.clone();
++            let ifname = iface.name.to_owned();
++            let wireguard_socket = wireguard_socket.clone();
++            async move {
++                if let Err(err) = this.wireguard_write_back(ifname.clone(), wireguard_socket).await {
++                    warn!("wireguard_write_back thread failed: {:?}", err);
++                };
++                debug!("wireguard_write_back thread closed: '{}'", ifname);
++            }
++        });
++        debug!("\tStarted wireguard_write_back thread for interface '{}'", iface.name);
++
++        Ok(())
++    }
++
++    async fn wireguard_write_back(&self, ifname: String, wireguard_socket: Arc<UdpSocket>) -> Result<()> {
++        let mut buf = [0; BUFFER_SIZE];
++        loop {
++            let routine = self.routines.get(&ifname).ok_or_else(|| anyhow!("Interface '{}' not found", ifname))?;
++            debug!("Got interface {} from routines", ifname);
++            if routine.is_closing {
++                warn!("Interface '{}' is closing; closing thread", ifname);
++                return Ok(());
++            }
++            let socket = routine.src_socket.clone();
++            drop(routine);
++
++            debug!("Waiting for data from interface '{}'", ifname);
++            select! {
++                t = socket.recv_from(&mut buf) => {
++                    match t {
++                        Ok((received_bytes, _)) => {
++                            debug!("Received {} bytes from interface '{}'", received_bytes, ifname);
++                            let mut routine = self.routines.get_mut(&ifname).ok_or_else(|| anyhow!("Interface '{}' not found", ifname))?;
++                            routine.last_received_at = std::time::Instant::now();
++                            routine.total_received_bytes += received_bytes;
++                            drop(routine);
++
++                            let wg_addr = *self.source_addr.lock().unwrap();
++                            wireguard_socket.send_to(&buf[..received_bytes], wg_addr).await?;
++                            trace!("\tSent {} bytes to wireguard", received_bytes);
++                        }
++                        Err(err) => {
++                            warn!("Error receiving from interface '{}': {:?}", ifname, err);
++                            let mut routine = self.routines.get_mut(&ifname).ok_or_else(|| anyhow!("Interface '{}' not found", ifname))?;
++                            routine.is_closing = true;
++                        }
++                    }
++                }
++                _ = self.shutdown.cancelled() => {
++                    debug!("Shutdown signal received; closing thread");
++                    return Ok(());
++                }
++            }
++        }
++    }
++
++    async fn receive_from_wireguard(&self, wireguard_socket: Arc<UdpSocket>) -> Result<()> {
++        let mut buf = [0; BUFFER_SIZE];
++        loop {
++            let span = info_span!("receive_from_wireguard_loop");
++            select! {
++                _ = self.shutdown.cancelled() => {
++                    debug!("Shutdown signal received; closing thread");
++                    return Ok(());
++                }
++                result = wireguard_socket.recv_from(&mut buf).instrument(span) => {
++                    match result {
++                        Ok((received_bytes, src_addr)) => {
++                            *self.source_addr.lock().unwrap() = src_addr;
++                            trace!(
++                                received_bytes = received_bytes,
++                                src_addr = src_addr.to_string(),
++                                "Received {} bytes from wireguard on '{:?}'", received_bytes, src_addr
++                            );
++                            trace!("\tSending to {} clients", self.routines.len());
++
++                            let drop_list = futures::stream::iter(self.routines.iter_mut())
++                                .filter_map(|mut routine| async move {
++                                    routine.send_to(&buf[..received_bytes]).await
++                                })
++                                .collect::<Vec<String>>()
++                                .await;
++
++                            if !drop_list.is_empty() {
++                                drop_list.into_iter().for_each(|ifname| {
++                                    self.routines.remove(&ifname);
++                                });
++                            }
++
++                            trace!("Sent to {} clients", self.routines.len());
++                        }
++                        Err(err) => {
++                            warn!("Error receiving from wireguard: {:?}", err);
++                        }
++                    }
++                }
++            }
++        }
++    }
++}
++
++fn get_address_by_interface(iface: &NetworkInterface) -> Option<std::net::IpAddr> {
++    iface.addr.iter().find_map(|addr| {
++        let ip = addr.ip();
++        match ip {
++            std::net::IpAddr::V4(v4) => {
++                if v4.is_private() {
++                    return Some(ip);
++                }
++                if v4.is_loopback() {
++                    return Some(ip);
++                }
++                if v4.is_link_local() {
++                    return Some(ip);
++                }
++                if v4.is_multicast() {
++                    return None;
++                }
++                Some(ip)
++            }
++            std::net::IpAddr::V6(_) => None,
++        }
++    })
++} 
+\ No newline at end of file
+diff --git a/crates/client/src/types.rs b/crates/client/src/types.rs
+new file mode 100644
+index 0000000..fefd64f
+--- /dev/null
++++ b/crates/client/src/types.rs
+@@ -0,0 +1,94 @@
++use std::net::SocketAddr;
++use std::time::Instant;
++
++use serde::{Deserialize, Serialize};
++use tracing::{debug, info, trace, warn};
++
++#[derive(Debug, Clone, Serialize, Deserialize)]
++pub struct Settings {
++    pub client: ClientSettings,
++}
++
++#[derive(Debug, Clone, Serialize, Deserialize)]
++#[serde(rename_all = "camelCase")]
++pub struct ClientSettings {
++    pub description: Option<String>,
++    pub listen_addr: String,
++    pub dst_addr: String,
++    pub write_timeout: Option<u64>,
++    pub excluded_interfaces: Vec<String>,
++    pub web_manager: Option<WebManager>,
++}
++
++#[derive(Debug, Clone, Serialize, Deserialize)]
++#[serde(rename_all = "camelCase")]
++pub struct WebManager {
++    pub listen_addr: Option<String>,
++    pub username: Option<String>,
++    pub password: Option<String>,
++}
++
++pub struct SendingRoutine {
++    pub ifname: String,
++    pub src_socket: std::sync::Arc<tokio::net::UdpSocket>,
++    pub src_addr: SocketAddr,
++    pub dst_addr: SocketAddr,
++    pub last_received_at: Instant,
++    pub total_received_bytes: usize,
++    pub is_closing: bool,
++}
++
++impl SendingRoutine {
++    pub fn new(ifname: String, src_socket: std::sync::Arc<tokio::net::UdpSocket>, src_addr: SocketAddr, dst_addr: SocketAddr) -> Self {
++        info!(
++            event = "added",
++            iface_name = ifname,
++            src_addr = src_addr.to_string(),
++            dst_addr = dst_addr.to_string(),
++            "\tAdded interface '{}' to sending routines", ifname
++        );
++        Self {
++            ifname,
++            src_socket,
++            src_addr,
++            dst_addr,
++            last_received_at: Instant::now(),
++            total_received_bytes: 0,
++            is_closing: false,
++        }
++    }
++
++    pub async fn send_to(&mut self, buf: &[u8]) -> Option<String> {
++        match self.src_socket.send_to(buf, self.dst_addr).await {
++            Ok(sent_bytes) => {
++                trace!(
++                    sent_bytes = sent_bytes,
++                    dst_ifname = self.ifname,
++                    dst_addr = self.dst_addr.to_string(),
++                    "\tSent {} bytes on iface {} to client '{:?}'", sent_bytes, self.ifname, self.dst_addr
++                );
++                None
++            }
++            Err(err) => {
++                warn!(
++                    event = "disconnect",
++                    dst_addr = self.dst_addr.to_string(),
++                    "Error writing to client '{:?}', terminating it: {:?}", self.dst_addr, err
++                );
++                Some(self.ifname.clone())
++            }
++        }
++    }
++}
++
++impl Drop for SendingRoutine {
++    fn drop(&mut self) {
++        debug!(
++            event = "removed",
++            iface_name = self.ifname,
++            src_addr = self.src_addr.to_string(),
++            dst_addr = self.dst_addr.to_string(),
++            "\tRemoved interface '{}' from sending routines", self.ifname
++        );
++    }
++} 
+\ No newline at end of file
+diff --git a/crates/server/src/client/connection.rs b/crates/server/src/client/connection.rs
+new file mode 100644
+index 0000000..79720a9
+--- /dev/null
++++ b/crates/server/src/client/connection.rs
+@@ -0,0 +1,42 @@
++use std::sync::Arc;
++
++use anyhow::Result;
++use tokio::net::UdpSocket;
++use tracing::{info, trace};
++
++use crate::BUFFER_SIZE;
++use crate::client::types::{Client, Clients};
++
++/// Handles receiving data from clients and forwarding it to the WireGuard interface
++#[tracing::instrument(skip_all)]
++pub async fn receive_from_client(
++    clients: Clients,
++    client_socket: Arc<UdpSocket>,
++    wireguard_socket: Arc<UdpSocket>,
++    wireguard_addr: &str,
++) -> Result<()> {
++    let mut buf = [0; BUFFER_SIZE];
++    loop {
++        let (received_bytes, src_addr) = client_socket.recv_from(&mut buf).await?;
++
++        trace!(
++            received_bytes = received_bytes,
++            src_addr = src_addr.to_string(),
++            "Received {} bytes from client '{:?}'", received_bytes, src_addr
++        );
++
++        // Update client state
++        clients.entry(src_addr).and_modify(|client| {
++            client.update(received_bytes);
++        }).or_insert_with(|| {
++            info!("New client connected: '{:?}'", src_addr);
++            Client::new(src_addr)
++        });
++
++        // Forward to WireGuard
++        wireguard_socket.send_to(&buf[..received_bytes], wireguard_addr).await?;
++        trace!(
++            "\tSent {} bytes to wireguard on '{:?}'", received_bytes, wireguard_addr
++        );
++    }
++} 
+\ No newline at end of file
+diff --git a/crates/server/src/client/manager.rs b/crates/server/src/client/manager.rs
+new file mode 100644
+index 0000000..e0f24a8
+--- /dev/null
++++ b/crates/server/src/client/manager.rs
+@@ -0,0 +1,66 @@
++use std::net::SocketAddr;
++use std::sync::Arc;
++use std::time::{Duration, Instant};
++
++use dashmap::DashMap;
++use tracing::{info, warn};
++
++use crate::client::types::{Client, Clients};
++
++/// Manages client connections and their lifecycle
++#[derive(Clone)]
++pub struct ClientManager {
++    clients: Clients,
++    timeout: Duration,
++}
++
++impl ClientManager {
++    /// Creates a new client manager with the specified timeout
++    pub fn new(timeout_seconds: u64) -> Self {
++        Self {
++            clients: Arc::new(DashMap::new()),
++            timeout: Duration::from_secs(timeout_seconds),
++        }
++    }
++
++    /// Returns a reference to the clients collection
++    pub fn clients(&self) -> Clients {
++        self.clients.clone()
++    }
++
++    /// Adds or updates a client with the given address
++    pub fn add_or_update_client(&self, addr: SocketAddr, bytes_received: usize) {
++        self.clients.entry(addr).and_modify(|client| {
++            client.update(bytes_received);
++        }).or_insert_with(|| {
++            info!("New client connected: '{:?}'", addr);
++            Client::new(addr)
++        });
++    }
++
++    /// Removes a client by address
++    pub fn remove_client(&self, addr: SocketAddr) {
++        self.clients.remove(&addr);
++        info!("Client removed: '{:?}'", addr);
++    }
++
++    /// Checks for and removes timed-out clients
++    pub fn cleanup_timeout_clients(&self) {
++        let now = Instant::now();
++        let timeout_clients: Vec<SocketAddr> = self.clients
++            .iter()
++            .filter(|client| now.duration_since(client.last_received_at) > self.timeout)
++            .map(|client| client.addr)
++            .collect();
++
++        for addr in timeout_clients {
++            warn!("Client '{:?}' timed out", addr);
++            self.remove_client(addr);
++        }
++    }
++
++    /// Gets the number of connected clients
++    pub fn client_count(&self) -> usize {
++        self.clients.len()
++    }
++} 
+\ No newline at end of file
+diff --git a/crates/server/src/client/mod.rs b/crates/server/src/client/mod.rs
+new file mode 100644
+index 0000000..1638b69
+--- /dev/null
++++ b/crates/server/src/client/mod.rs
+@@ -0,0 +1,7 @@
++mod connection;
++mod manager;
++mod types;
++
++pub use connection::receive_from_client;
++pub use manager::ClientManager;
++pub use types::Clients; 
+\ No newline at end of file
+diff --git a/crates/server/src/client/types.rs b/crates/server/src/client/types.rs
+new file mode 100644
+index 0000000..20b95a8
+--- /dev/null
++++ b/crates/server/src/client/types.rs
+@@ -0,0 +1,36 @@
++use std::net::SocketAddr;
++use std::sync::Arc;
++use std::time::Instant;
++
++use dashmap::DashMap;
++
++/// Represents a connected client with its state and statistics
++#[derive(Debug)]
++pub struct Client {
++    /// The client's socket address
++    pub addr: SocketAddr,
++    /// Timestamp of the last received packet
++    pub last_received_at: Instant,
++    /// Total number of bytes received from this client
++    pub total_received_bytes: usize,
++}
++
++impl Client {
++    /// Creates a new client with the given address and current timestamp
++    pub fn new(addr: SocketAddr) -> Self {
++        Self {
++            addr,
++            last_received_at: Instant::now(),
++            total_received_bytes: 0,
++        }
++    }
++
++    /// Updates the client's last received timestamp and adds to total bytes
++    pub fn update(&mut self, bytes_received: usize) {
++        self.last_received_at = Instant::now();
++        self.total_received_bytes += bytes_received;
++    }
++}
++
++/// Thread-safe collection of connected clients
++pub type Clients = Arc<DashMap<SocketAddr, Client>>; 
+\ No newline at end of file
+diff --git a/crates/server/src/config.rs b/crates/server/src/config.rs
+new file mode 100644
+index 0000000..29446f6
+--- /dev/null
++++ b/crates/server/src/config.rs
+@@ -0,0 +1,71 @@
++use anyhow::Result;
++use serde::{Deserialize, Serialize};
++use tracing::{info, warn};
++
++use crate::wireguard::types::WireGuardConfig;
++
++#[derive(Debug, Serialize, Deserialize)]
++pub struct Settings {
++    pub server: Server,
++}
++
++#[derive(Debug, Serialize, Deserialize)]
++#[serde(rename_all = "camelCase")]
++pub struct Server {
++    pub description: Option<String>,
++    pub listen_addr: String,
++    pub dst_addr: String,
++    // Client timeout in seconds. If a client doesn't send any packet for n seconds, engarde stops sending it packets.
++    // You will need to set it to a slightly higher value than the PersistentKeepalive option in WireGuard clients.
++    pub client_timeout: Option<u64>,
++    // Write timeout in milliseconds for socket writes. You can try to lower it if you're experiencing latency peaks, or raising it if the connection is unstable.
++    // You can disable write timeout by setting to 0; but it's easy to have issues if you need low latency.
++    pub write_timeout: Option<u64>,
++    pub web_manager: Option<WebManager>,
++    pub wireguard: Option<WireGuardConfig>,
++}
++
++#[derive(Debug, Serialize, Deserialize)]
++#[serde(rename_all = "camelCase")]
++pub struct WebManager {
++    pub listen_addr: Option<String>,
++    pub username: Option<String>,
++    pub password: Option<String>,
++}
++
++pub fn load_config() -> Result<Settings> {
++    let config_path = std::env::args().nth(1).unwrap_or_else(|| {
++        String::from("engarde.yml")
++    });
++
++    let settings = std::fs::read_to_string(&config_path)?;
++    let settings: Settings = serde_yaml::from_str(&settings)?;
++    
++    if let Some(description) = &settings.server.description {
++        info!("{}", description);
++    }
++
++    Ok(settings)
++}
++
++pub fn validate_settings(mut settings: Settings) -> Result<Settings> {
++    // Validate and set default client timeout
++    if matches!(settings.server.client_timeout, None | Some(0)) {
++        info!("Client timeout not set; setting to 30s.");
++        settings.server.client_timeout = Some(30);
++    }
++
++    // Validate and set default write timeout
++    if settings.server.write_timeout.is_none() {
++        info!("Write timeout not set; setting to 10ms.");
++        settings.server.write_timeout = Some(10);
++    }
++
++    // Warn if write timeout is enabled (not implemented yet)
++    if !matches!(settings.server.write_timeout, Some(0)) {
++        warn!("Write timeout is not implemented yet: setting to 0 to disable!");
++        settings.server.write_timeout = Some(0);
++    }
++
++    Ok(settings)
++} 
+\ No newline at end of file
+diff --git a/crates/server/src/main.rs b/crates/server/src/main.rs
+index 946afd6..87933cd 100644
+--- a/crates/server/src/main.rs
++++ b/crates/server/src/main.rs
+@@ -1,249 +1,122 @@
+-use std::net::SocketAddr;
+ use std::sync::Arc;
+-use std::time::Instant;
++use std::time::Duration;
+ 
+ use anyhow::Result;
+-use dashmap::DashMap;
+-use futures::StreamExt;
+-use serde::{Deserialize, Serialize};
+ use tokio::net::UdpSocket;
+-// use tokio::time::sleep;
+-use tracing::{debug, info, trace, warn};
++use tracing::{info, warn};
++
++mod config;
++mod client;
++mod wireguard;
++
++use client::ClientManager;
+ 
+ // The maximum transmission unit (MTU) of an Ethernet frame is 1518 bytes with the normal untagged
+ // Ethernet frame overhead of 18 bytes and the 1500-byte payload.
+ const BUFFER_SIZE: usize = 1500;
+ 
+-// type Clients = Arc<RwLock<HashMap<SocketAddr, Client>>>;
+-type Clients = Arc<DashMap<SocketAddr, Client>>;
+-
+-struct Client {
+-    addr: SocketAddr,
+-    last_received_at: Instant,
+-    total_received_bytes: usize,
+-}
+-
+-#[derive(Debug, Serialize, Deserialize)]
+-pub struct Settings {
+-    server: Server,
+-}
+-
+-#[derive(Debug, Serialize, Deserialize)]
+-#[serde(rename_all = "camelCase")]
+-pub struct Server {
+-    description: Option<String>,
+-    listen_addr: String,
+-    dst_addr: String,
+-    // Client timeout in seconds. If a client doesn't send any packet for n seconds, engarde stops sending it packets.
+-    // You will need to set it to a slightly higher value than the PersistentKeepalive option in WireGuard clients.
+-    client_timeout: Option<u64>,
+-    // Write timeout in milliseconds for socket writes. You can try to lower it if you're experiencing latency peaks, or raising it if the connection is unstable.
+-    // You can disable write timeout by setting to 0; but it's easy to have issues if you need low latency.
+-    write_timeout: Option<u64>,
+-    web_manager: Option<WebManager>,
+-}
+-
+-#[derive(Debug, Serialize, Deserialize)]
+-#[serde(rename_all = "camelCase")]
+-pub struct WebManager {
+-    listen_addr: Option<String>,
+-    username: Option<String>,
+-    password: Option<String>,
+-}
+-
+ #[tokio::main]
+ async fn main() -> Result<()> {
++    // Initialize logging and print header
+     let _guard = shared::init()?;
++    print_header_info()?;
+ 
+-    let rengarde_official_build = option_env!("RENGARDE_OFFICIAL_BUILD").unwrap_or("false").parse::<bool>()?;
+-    let cargo_pkg_name = env!("CARGO_PKG_NAME");
+-    let cargo_pkg_version = env!("CARGO_PKG_VERSION");
+-    let vergen_git_describe = env!("VERGEN_GIT_DESCRIBE");
+-    let vergen_git_dirty = env!("VERGEN_GIT_DIRTY");
+-    let vergen_build_timestamp = env!("VERGEN_BUILD_TIMESTAMP");
+-    let vergen_cargo_target_triple = env!("VERGEN_CARGO_TARGET_TRIPLE");
+-    let rust_runtime = if cfg!(feature = "rt-rayon") {
+-        "rayon"
+-    } else if cfg!(feature = "rt-tokio") {
+-        "tokio"
+-    } else {
+-        unimplemented!("No runtime feature enabled");
+-    };
+-
+-    shared::print_header(
+-        rengarde_official_build,
+-        cargo_pkg_name,
+-        cargo_pkg_version,
+-        vergen_git_describe,
+-        vergen_git_dirty,
+-        vergen_build_timestamp,
+-        vergen_cargo_target_triple,
+-        rust_runtime,
+-    );
+-
+-    let config_path = std::env::args().nth(1).unwrap_or_else(|| {
+-        String::from("engarde.yml")
+-    });
+-
+-    let settings = std::fs::read_to_string(&config_path)?;
+-    let mut settings: Settings = serde_yaml::from_str(&settings)?;
+-    if let Some(description) = &settings.server.description {
+-        info!("{}", description);
+-    }
+-
+-    if matches!(settings.server.client_timeout, None | Some(0)) {
+-        info!("Client timeout not set; setting to 30s.");
+-        settings.server.client_timeout = Some(30);
+-    }
++    // Load and validate configuration
++    let settings = config::load_config()?;
++    let settings = config::validate_settings(settings)?;
+ 
+-    // default to 10; but allow 0 for disabling write timeout
+-    if settings.server.write_timeout.is_none() {
+-        info!("Write timeout not set; setting to 10ms.");
+-        settings.server.write_timeout = Some(10);
+-    }
+-    // warn if write timeout is enabled; it's not implemented yet
+-    if !matches!(settings.server.write_timeout, Some(0)) {
+-        warn!("Write timeout is not implemented yet: setting to 0 to disable!");
+-        settings.server.write_timeout = Some(0);
+-    }
+-
+-    let settings = settings;
+-    // dbg!(&settings);
+-
+-    // let clients: Clients = Arc::new(RwLock::new(HashMap::new()));
+-    let clients: Clients = Arc::new(DashMap::new());
+-
+-    // wireguard_addr:  = settings.server.dst_addr.parse()?;
++    // Initialize client manager and sockets
++    let client_manager = ClientManager::new(settings.server.client_timeout.unwrap());
+     let wireguard_socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+     let client_socket = Arc::new(UdpSocket::bind(&settings.server.listen_addr).await?);
+ 
+     info!("Listening on: {}", &settings.server.listen_addr);
+ 
++    // Start the web manager if configured
+     if let Some(web_manager) = &settings.server.web_manager {
+         warn!("Web manager is not implemented yet: {:?}", web_manager);
+     }
+ 
++    // Spawn the main processing tasks
+     let join_receive_from_client = tokio::spawn({
+-        // let service = service.clone();
+-        let clients = clients.clone();
++        let client_manager = client_manager.clone();
+         let client_socket = client_socket.clone();
+         let wireguard_socket = wireguard_socket.clone();
+         async move {
+-            if let Err(err) = receive_from_client(clients, client_socket, wireguard_socket, &settings.server.dst_addr).await {
++            if let Err(err) = client::receive_from_client(
++                client_manager.clients(),
++                client_socket,
++                wireguard_socket,
++                &settings.server.dst_addr,
++            ).await {
+                 warn!("receive_from_client failed: {:?}", err);
+             }
+         }
+     });
+ 
+     let join_receive_from_wireguard = tokio::spawn({
+-        // let service = service.clone();
+-        let clients = clients.clone();
++        let client_manager = client_manager.clone();
+         let wireguard_socket = wireguard_socket.clone();
+         let client_socket = client_socket.clone();
+         async move {
+-            if let Err(err) = receive_from_wireguard(clients, wireguard_socket, client_socket, settings.server.client_timeout.unwrap(), settings.server.write_timeout.unwrap()).await {
++            if let Err(err) = wireguard::receive_from_wireguard(
++                client_manager.clients(),
++                wireguard_socket,
++                client_socket,
++                settings.server.client_timeout.unwrap(),
++                settings.server.write_timeout.unwrap(),
++            ).await {
+                 panic!("receive_from_wireguard thread failed: {:?}", err);
+             }
+         }
+     });
+ 
++    // Spawn client cleanup task
++    let join_cleanup = tokio::spawn({
++        let client_manager = client_manager.clone();
++        async move {
++            loop {
++                tokio::time::sleep(Duration::from_secs(5)).await;
++                client_manager.cleanup_timeout_clients();
++            }
++        }
++    });
++
++    // Wait for tasks to complete
+     join_receive_from_client.await.unwrap();
+     join_receive_from_wireguard.await.unwrap();
++    join_cleanup.await.unwrap();
+     warn!("All threads joined; exiting...");
+ 
+     Ok(())
+ }
+ 
+-#[tracing::instrument(skip_all)]
+-async fn receive_from_client(clients: Clients, client_socket: Arc<UdpSocket>, wireguard_socket: Arc<UdpSocket>, wireguard_addr: &str) -> Result<()> {
+-    // tracing::info!(histogram.baz = 10, "histogram example",);
+-
+-    let mut buf = [0; BUFFER_SIZE];
+-    loop {
+-        let (received_bytes, src_addr) = client_socket.recv_from(&mut buf).await?;
+-        let received_at = Instant::now();
+-
+-        trace!(
+-            received_bytes = received_bytes,
+-            src_addr = src_addr.to_string(),
+-            "Received {} bytes from client '{:?}'", received_bytes, src_addr
+-        );
+-
+-        // update the client last received timestamp
+-        clients.entry(src_addr).and_modify(|client| {
+-            client.last_received_at = received_at;
+-            client.total_received_bytes += received_bytes;
+-        }).or_insert_with(|| {
+-            info!("New client connected: '{:?}'", src_addr);
+-            Client {
+-                addr: src_addr,
+-                last_received_at: received_at,
+-                total_received_bytes: received_bytes,
+-            }
+-        });
+-
+-        // send to wireguard
+-        wireguard_socket.send_to(&buf[..received_bytes], wireguard_addr).await?;
+-        trace!(
+-            // sent_bytes = received_bytes,
+-            // dst_addr = wireguard_addr,
+-            "\tSent {} bytes to wireguard on '{:?}'", received_bytes, wireguard_addr
+-        );
+-    }
+-}
++fn print_header_info() -> Result<()> {
++    let rengarde_official_build = option_env!("RENGARDE_OFFICIAL_BUILD").unwrap_or("false").parse::<bool>()?;
++    let cargo_pkg_name = env!("CARGO_PKG_NAME");
++    let cargo_pkg_version = env!("CARGO_PKG_VERSION");
++    let vergen_git_describe = env!("VERGEN_GIT_DESCRIBE");
++    let vergen_git_dirty = env!("VERGEN_GIT_DIRTY");
++    let vergen_build_timestamp = env!("VERGEN_BUILD_TIMESTAMP");
++    let vergen_cargo_target_triple = env!("VERGEN_CARGO_TARGET_TRIPLE");
++    let rust_runtime = if cfg!(feature = "rt-rayon") {
++        "rayon"
++    } else if cfg!(feature = "rt-tokio") {
++        "tokio"
++    } else {
++        unimplemented!("No runtime feature enabled");
++    };
+ 
+-#[tracing::instrument(skip_all)]
+-async fn receive_from_wireguard(clients: Clients, wireguard_socket: Arc<UdpSocket>, client_socket: Arc<UdpSocket>, client_timeout: u64, _write_timeout: u64) -> Result<()> {
+-    let mut buf = [0; BUFFER_SIZE];
+-    loop {
+-        let received_bytes = wireguard_socket.recv(&mut buf).await?;
+-        let received_at = Instant::now();
+-
+-        debug!(
+-            // received_bytes = received_bytes,
+-            // src_addr = ,
+-            "Received {} bytes from wireguard", received_bytes
+-        );
+-
+-        // send to clients
+-        let drop_list: Vec<_> = futures::stream::iter(clients.iter())
+-            .filter_map(|client| {
+-                let client_socket = client_socket.clone();
+-                async move {
+-                    // check if the client has timed out
+-                    if received_at.duration_since(client.last_received_at).as_secs() > client_timeout {
+-                        warn!("Client '{:?}' timed out", client.addr);
+-                        return Some(client.addr);
+-                    }
+-                    // implement a write timeout
+-                    // if write_timeout > 0 {
+-                    //
+-                    // }
+-                    // send to client
+-                    if client_socket.send_to(&buf[..received_bytes], &client.addr).await.is_err() {
+-                        warn!("Error writing to client '{:?}', terminating it", client.addr);
+-                        return Some(client.addr);
+-                    }
+-
+-                    trace!(
+-                        sent_bytes = received_bytes,
+-                        dst_addr = client.addr.to_string(),
+-                        "\tSent {} bytes to client '{:?}'", received_bytes, client.addr
+-                    );
+-                    None
+-                }
+-            })
+-            .collect::<Vec<_>>()
+-            .await;
+-
+-        // drop the clients that have timed out
+-        if !drop_list.is_empty() {
+-            // TODO: can we do this with DashMap without locking each iteration?
+-            // let mut clients_locked = clients.write().unwrap();
+-            drop_list.into_iter().for_each(|addr| {
+-                clients.remove(&addr);
+-            });
+-            // drop(clients_locked);
+-        }
+-    }
++    shared::print_header(
++        rengarde_official_build,
++        cargo_pkg_name,
++        cargo_pkg_version,
++        vergen_git_describe,
++        vergen_git_dirty,
++        vergen_build_timestamp,
++        vergen_cargo_target_triple,
++        rust_runtime,
++    );
++
++    Ok(())
+ }
+diff --git a/crates/server/src/wireguard/connection.rs b/crates/server/src/wireguard/connection.rs
+new file mode 100644
+index 0000000..b4bf16f
+--- /dev/null
++++ b/crates/server/src/wireguard/connection.rs
+@@ -0,0 +1,65 @@
++use std::sync::Arc;
++
++use anyhow::Result;
++use futures::StreamExt;
++use tokio::net::UdpSocket;
++use tracing::{debug, trace, warn};
++
++use crate::BUFFER_SIZE;
++use crate::client::Clients;
++use crate::wireguard::types::WireGuardConfig;
++
++/// Handles receiving data from WireGuard interface and forwarding it to clients
++#[tracing::instrument(skip_all)]
++pub async fn receive_from_wireguard(
++    clients: Clients,
++    wireguard_socket: Arc<UdpSocket>,
++    client_socket: Arc<UdpSocket>,
++    client_timeout: u64,
++    _write_timeout: u64,
++) -> Result<()> {
++    let config = WireGuardConfig::new(client_timeout, _write_timeout);
++    let mut buf = [0; BUFFER_SIZE];
++
++    loop {
++        let received_bytes = wireguard_socket.recv(&mut buf).await?;
++        let received_at = std::time::Instant::now();
++
++        debug!("Received {} bytes from wireguard", received_bytes);
++
++        // Send to clients
++        let drop_list: Vec<_> = futures::stream::iter(clients.iter())
++            .filter_map(|client| {
++                let client_socket = client_socket.clone();
++                async move {
++                    // Check if the client has timed out
++                    if received_at.duration_since(client.last_received_at) > config.client_timeout {
++                        warn!("Client '{:?}' timed out", client.addr);
++                        return Some(client.addr);
++                    }
++
++                    // Send to client
++                    if client_socket.send_to(&buf[..received_bytes], &client.addr).await.is_err() {
++                        warn!("Error writing to client '{:?}', terminating it", client.addr);
++                        return Some(client.addr);
++                    }
++
++                    trace!(
++                        sent_bytes = received_bytes,
++                        dst_addr = client.addr.to_string(),
++                        "\tSent {} bytes to client '{:?}'", received_bytes, client.addr
++                    );
++                    None
++                }
++            })
++            .collect::<Vec<_>>()
++            .await;
++
++        // Drop the clients that have timed out
++        if !drop_list.is_empty() {
++            drop_list.into_iter().for_each(|addr| {
++                clients.remove(&addr);
++            });
++        }
++    }
++} 
+\ No newline at end of file
+diff --git a/crates/server/src/wireguard/mod.rs b/crates/server/src/wireguard/mod.rs
+new file mode 100644
+index 0000000..b5fefcd
+--- /dev/null
++++ b/crates/server/src/wireguard/mod.rs
+@@ -0,0 +1,4 @@
++mod connection;
++pub mod types;
++
++pub use connection::receive_from_wireguard; 
+\ No newline at end of file
+diff --git a/crates/server/src/wireguard/types.rs b/crates/server/src/wireguard/types.rs
+new file mode 100644
+index 0000000..5d68a30
+--- /dev/null
++++ b/crates/server/src/wireguard/types.rs
+@@ -0,0 +1,21 @@
++use std::time::Duration;
++use serde::{Deserialize, Serialize};
++
++/// Configuration for WireGuard interface handling
++#[derive(Debug, Clone, Serialize, Deserialize)]
++pub struct WireGuardConfig {
++    /// Client timeout in seconds
++    pub client_timeout: Duration,
++    /// Write timeout in milliseconds (currently unused)
++    pub write_timeout: Duration,
++}
++
++impl WireGuardConfig {
++    /// Creates a new WireGuard configuration
++    pub fn new(client_timeout_seconds: u64, write_timeout_ms: u64) -> Self {
++        Self {
++            client_timeout: Duration::from_secs(client_timeout_seconds),
++            write_timeout: Duration::from_millis(write_timeout_ms),
++        }
++    }
++} 
+\ No newline at end of file
+diff --git a/crates/shared/src/lib.rs b/crates/shared/src/lib.rs
+index d5ed11a..b8adc33 100644
+--- a/crates/shared/src/lib.rs
++++ b/crates/shared/src/lib.rs
+@@ -1,9 +1,12 @@
+-use anyhow::Result;
++use anyhow::{Context, Result};
+ use opentelemetry::{global, KeyValue};
+ use opentelemetry_otlp::WithExportConfig;
+-use opentelemetry_sdk::{metrics::{
+-    MeterProviderBuilder, PeriodicReader, SdkMeterProvider,
+-}, Resource, runtime, trace::{BatchConfig, RandomIdGenerator, Sampler, Tracer}};
++use opentelemetry_sdk::{
++    metrics::{MeterProviderBuilder, PeriodicReader, SdkMeterProvider},
++    Resource,
++    runtime,
++    trace::{BatchConfig, RandomIdGenerator, Sampler, Tracer},
++};
+ use opentelemetry_sdk::metrics::reader::{DefaultAggregationSelector, DefaultTemporalitySelector};
+ use opentelemetry_semantic_conventions::resource::{DEPLOYMENT_ENVIRONMENT, SERVICE_NAME, SERVICE_VERSION};
+ use opentelemetry_semantic_conventions::SCHEMA_URL;
+@@ -11,6 +14,23 @@ use tracing_core::{Level, LevelFilter};
+ use tracing_opentelemetry::{MetricsLayer, OpenTelemetryLayer};
+ use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
+ 
++#[derive(Debug)]
++pub struct TracingConfig {
++    pub endpoint: Option<String>,
++    pub log_level: Level,
++    pub default_directive: LevelFilter,
++}
++
++impl Default for TracingConfig {
++    fn default() -> Self {
++        Self {
++            endpoint: std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok(),
++            log_level: Level::DEBUG,
++            default_directive: LevelFilter::INFO,
++        }
++    }
++}
++
+ #[allow(clippy::too_many_arguments)]
+ pub fn print_header(
+     rengarde_official_build: bool,
+@@ -23,9 +43,9 @@ pub fn print_header(
+     rust_runtime: &str,
+ ) {
+     let version_string = if rengarde_official_build {
+-        cargo_pkg_version
++        cargo_pkg_version.to_string()
+     } else {
+-        &format!(
++        format!(
+             "{}{} built at {} for {} - UNOFFICIAL BUILD",
+             vergen_git_describe,
+             if vergen_git_dirty == "true" { "* (dirty)" } else { "" },
+@@ -55,13 +75,10 @@ impl Drop for Guard {
+     }
+ }
+ 
+-pub fn init() -> Result<Guard>
+-{
+-    let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok();
+-    let meter_provider = init_tracing_subscriber(endpoint.as_ref().map(String::as_str));
+-    Ok(Guard {
+-        meter_provider,
+-    })
++pub fn init() -> Result<Guard> {
++    let config = TracingConfig::default();
++    let meter_provider = init_tracing_subscriber(&config);
++    Ok(Guard { meter_provider })
+ }
+ 
+ fn resource() -> Resource {
+@@ -69,14 +86,13 @@ fn resource() -> Resource {
+         [
+             KeyValue::new(SERVICE_NAME, env!("CARGO_PKG_NAME")),
+             KeyValue::new(SERVICE_VERSION, env!("CARGO_PKG_VERSION")),
+-            // KeyValue::new(RUST_RUNTIME, env!("")),
+             KeyValue::new(DEPLOYMENT_ENVIRONMENT, "develop"),
+         ],
+         SCHEMA_URL,
+     )
+ }
+ 
+-fn init_meter_provider(endpoint: &str) -> SdkMeterProvider {
++fn init_meter_provider(endpoint: &str) -> Result<SdkMeterProvider> {
+     let exporter = opentelemetry_otlp::new_exporter()
+         .tonic()
+         .with_endpoint(endpoint);
+@@ -86,7 +102,7 @@ fn init_meter_provider(endpoint: &str) -> SdkMeterProvider {
+             Box::new(DefaultAggregationSelector::new()),
+             Box::new(DefaultTemporalitySelector::new()),
+         )
+-        .unwrap();
++        .context("Failed to build metrics exporter")?;
+ 
+     let reader = PeriodicReader::builder(exporter, runtime::Tokio)
+         .with_interval(std::time::Duration::from_secs(5))
+@@ -98,47 +114,47 @@ fn init_meter_provider(endpoint: &str) -> SdkMeterProvider {
+         .build();
+ 
+     global::set_meter_provider(meter_provider.clone());
+-    meter_provider
++    Ok(meter_provider)
+ }
+ 
+-fn init_tracer_provider(endpoint: &str) -> Tracer {
++fn init_tracer_provider(endpoint: &str) -> Result<Tracer> {
+     let exporter = opentelemetry_otlp::new_exporter()
+         .tonic()
+         .with_endpoint(endpoint);
+ 
+-    opentelemetry_otlp::new_pipeline()
++    let tracer = opentelemetry_otlp::new_pipeline()
+         .tracing()
+         .with_trace_config(
+             opentelemetry_sdk::trace::Config::default()
+-                // Customize sampling strategy
+-                .with_sampler(Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(
+-                    1.0,
+-                ))))
+-                // If export trace to AWS X-Ray, you can use XrayIdGenerator
++                .with_sampler(Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(1.0))))
+                 .with_id_generator(RandomIdGenerator::default())
+                 .with_resource(resource()),
+         )
+         .with_batch_config(BatchConfig::default())
+         .with_exporter(exporter)
+         .install_batch(runtime::Tokio)
+-        .unwrap()
++        .context("Failed to install tracer provider")?;
++
++    Ok(tracer)
+ }
+ 
+-fn init_tracing_subscriber(endpoint: Option<&str>) -> Option<SdkMeterProvider> {
+-    let tracer_provider = endpoint.map(init_tracer_provider);
+-    let meter_provider = endpoint.map(init_meter_provider);
++fn init_tracing_subscriber(config: &TracingConfig) -> Option<SdkMeterProvider> {
++    let tracer_provider = config.endpoint.as_ref().map(|endpoint| {
++        init_tracer_provider(endpoint).unwrap()
++    });
++    let meter_provider = config.endpoint.as_ref().map(|endpoint| {
++        init_meter_provider(endpoint).unwrap()
++    });
+ 
+     tracing_subscriber::registry()
+-        .with(LevelFilter::from_level(
+-            Level::DEBUG,
+-        ))
++        .with(LevelFilter::from_level(config.log_level))
+         .with(tracing_subscriber::fmt::layer()
+             .with_level(true)
+             .with_target(false)
+             .with_thread_ids(true)
+             .with_filter(
+                 tracing_subscriber::EnvFilter::builder()
+-                    .with_default_directive(LevelFilter::INFO.into())
++                    .with_default_directive(config.default_directive.into())
+                     .from_env_lossy(),
+             )
+         )
+-- 
+2.43.0
+

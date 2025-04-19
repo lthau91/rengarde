@@ -1,15 +1,35 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use opentelemetry::{global, KeyValue};
 use opentelemetry_otlp::WithExportConfig;
-use opentelemetry_sdk::{metrics::{
-    MeterProviderBuilder, PeriodicReader, SdkMeterProvider,
-}, Resource, runtime, trace::{BatchConfig, RandomIdGenerator, Sampler, Tracer}};
+use opentelemetry_sdk::{
+    metrics::{MeterProviderBuilder, PeriodicReader, SdkMeterProvider},
+    Resource,
+    runtime,
+    trace::{BatchConfig, RandomIdGenerator, Sampler, Tracer},
+};
 use opentelemetry_sdk::metrics::reader::{DefaultAggregationSelector, DefaultTemporalitySelector};
 use opentelemetry_semantic_conventions::resource::{DEPLOYMENT_ENVIRONMENT, SERVICE_NAME, SERVICE_VERSION};
 use opentelemetry_semantic_conventions::SCHEMA_URL;
 use tracing_core::{Level, LevelFilter};
 use tracing_opentelemetry::{MetricsLayer, OpenTelemetryLayer};
 use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
+
+#[derive(Debug)]
+pub struct TracingConfig {
+    pub endpoint: Option<String>,
+    pub log_level: Level,
+    pub default_directive: LevelFilter,
+}
+
+impl Default for TracingConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok(),
+            log_level: Level::DEBUG,
+            default_directive: LevelFilter::INFO,
+        }
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 pub fn print_header(
@@ -23,9 +43,9 @@ pub fn print_header(
     rust_runtime: &str,
 ) {
     let version_string = if rengarde_official_build {
-        cargo_pkg_version
+        cargo_pkg_version.to_string()
     } else {
-        &format!(
+        format!(
             "{}{} built at {} for {} - UNOFFICIAL BUILD",
             vergen_git_describe,
             if vergen_git_dirty == "true" { "* (dirty)" } else { "" },
@@ -55,13 +75,10 @@ impl Drop for Guard {
     }
 }
 
-pub fn init() -> Result<Guard>
-{
-    let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok();
-    let meter_provider = init_tracing_subscriber(endpoint.as_ref().map(String::as_str));
-    Ok(Guard {
-        meter_provider,
-    })
+pub fn init() -> Result<Guard> {
+    let config = TracingConfig::default();
+    let meter_provider = init_tracing_subscriber(&config);
+    Ok(Guard { meter_provider })
 }
 
 fn resource() -> Resource {
@@ -69,14 +86,13 @@ fn resource() -> Resource {
         [
             KeyValue::new(SERVICE_NAME, env!("CARGO_PKG_NAME")),
             KeyValue::new(SERVICE_VERSION, env!("CARGO_PKG_VERSION")),
-            // KeyValue::new(RUST_RUNTIME, env!("")),
             KeyValue::new(DEPLOYMENT_ENVIRONMENT, "develop"),
         ],
         SCHEMA_URL,
     )
 }
 
-fn init_meter_provider(endpoint: &str) -> SdkMeterProvider {
+fn init_meter_provider(endpoint: &str) -> Result<SdkMeterProvider> {
     let exporter = opentelemetry_otlp::new_exporter()
         .tonic()
         .with_endpoint(endpoint);
@@ -86,7 +102,7 @@ fn init_meter_provider(endpoint: &str) -> SdkMeterProvider {
             Box::new(DefaultAggregationSelector::new()),
             Box::new(DefaultTemporalitySelector::new()),
         )
-        .unwrap();
+        .context("Failed to build metrics exporter")?;
 
     let reader = PeriodicReader::builder(exporter, runtime::Tokio)
         .with_interval(std::time::Duration::from_secs(5))
@@ -98,47 +114,47 @@ fn init_meter_provider(endpoint: &str) -> SdkMeterProvider {
         .build();
 
     global::set_meter_provider(meter_provider.clone());
-    meter_provider
+    Ok(meter_provider)
 }
 
-fn init_tracer_provider(endpoint: &str) -> Tracer {
+fn init_tracer_provider(endpoint: &str) -> Result<Tracer> {
     let exporter = opentelemetry_otlp::new_exporter()
         .tonic()
         .with_endpoint(endpoint);
 
-    opentelemetry_otlp::new_pipeline()
+    let tracer = opentelemetry_otlp::new_pipeline()
         .tracing()
         .with_trace_config(
             opentelemetry_sdk::trace::Config::default()
-                // Customize sampling strategy
-                .with_sampler(Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(
-                    1.0,
-                ))))
-                // If export trace to AWS X-Ray, you can use XrayIdGenerator
+                .with_sampler(Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(1.0))))
                 .with_id_generator(RandomIdGenerator::default())
                 .with_resource(resource()),
         )
         .with_batch_config(BatchConfig::default())
         .with_exporter(exporter)
         .install_batch(runtime::Tokio)
-        .unwrap()
+        .context("Failed to install tracer provider")?;
+
+    Ok(tracer)
 }
 
-fn init_tracing_subscriber(endpoint: Option<&str>) -> Option<SdkMeterProvider> {
-    let tracer_provider = endpoint.map(init_tracer_provider);
-    let meter_provider = endpoint.map(init_meter_provider);
+fn init_tracing_subscriber(config: &TracingConfig) -> Option<SdkMeterProvider> {
+    let tracer_provider = config.endpoint.as_ref().map(|endpoint| {
+        init_tracer_provider(endpoint).unwrap()
+    });
+    let meter_provider = config.endpoint.as_ref().map(|endpoint| {
+        init_meter_provider(endpoint).unwrap()
+    });
 
     tracing_subscriber::registry()
-        .with(LevelFilter::from_level(
-            Level::DEBUG,
-        ))
+        .with(LevelFilter::from_level(config.log_level))
         .with(tracing_subscriber::fmt::layer()
             .with_level(true)
             .with_target(false)
             .with_thread_ids(true)
             .with_filter(
                 tracing_subscriber::EnvFilter::builder()
-                    .with_default_directive(LevelFilter::INFO.into())
+                    .with_default_directive(config.default_directive.into())
                     .from_env_lossy(),
             )
         )
